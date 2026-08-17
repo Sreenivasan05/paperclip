@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -141,6 +142,29 @@ function createBroker() {
   return { broker, calls };
 }
 
+/**
+ * A real loopback bind probe, matching production's `isLoopbackPortAvailable`.
+ *
+ * The default used to be `async () => true`, which claimed every port in the
+ * dedicated range was free. On a developer or canary host that already runs a
+ * managed lane on `42000`, that lie made the suite allocate a port something
+ * else was listening on — so the spawned guest could not bind, and every
+ * assertion downstream failed for a reason that had nothing to do with the
+ * behaviour under test. It also meant the suite exercised allocation against a
+ * range it never actually checked (PAP-17419; PAP-17255 started this with
+ * "make exposure fixture honor occupied ports").
+ */
+async function isLoopbackPortFree(port: number): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once("error", () => resolve(false));
+    probe.listen(port, "127.0.0.1", () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
 function installDeps(overrides: {
   broker: BrokerClient;
   probeHealth?: () => Promise<boolean>;
@@ -150,7 +174,7 @@ function installDeps(overrides: {
 }) {
   setWorkspaceRuntimeExposureDepsForTests({
     broker: overrides.broker,
-    isPortAvailable: overrides.isPortAvailable ?? (async () => true),
+    isPortAvailable: overrides.isPortAvailable ?? isLoopbackPortFree,
     isBrokerAvailable: overrides.isBrokerAvailable ?? (async () => true),
     resolveHostname: async () => "runner.tail123.ts.net",
     probeHealth: overrides.probeHealth ?? (async () => true),
