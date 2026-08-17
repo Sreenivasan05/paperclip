@@ -22,10 +22,12 @@ class FakeTailscale {
   retargetPrimaryOnExpose = false;
   exposeCalls = 0;
   removeCalls = 0;
+  statusCalls = 0;
 
   run = (argv: string[]): CliResult => {
     const [, sub, a2, a3] = argv;
     if (sub === "serve" && a2 === "status") {
+      this.statusCalls += 1;
       return { code: 0, stdout: this.statusJson(), stderr: "", timedOut: false };
     }
     if (sub === "serve" && a2 === "--bg") {
@@ -64,6 +66,7 @@ function makeCore(
     present: true,
     loopbackOnly: true,
     ownerUidMatches: true,
+    inodes: ["5001"],
   }),
   nowIso: () => string = () => "2026-08-11T00:00:00.000Z",
 ) {
@@ -190,9 +193,9 @@ describe("expose", () => {
     // reaches only the root-owned audit file, which the calling account cannot
     // read. Distinguishing them relaxes nothing — all three deny below.
     for (const { ownership, code } of [
-      { ownership: { present: false, loopbackOnly: true, ownerUidMatches: true }, code: "listener_absent" },
-      { ownership: { present: true, loopbackOnly: false, ownerUidMatches: true }, code: "listener_not_loopback" },
-      { ownership: { present: true, loopbackOnly: true, ownerUidMatches: false }, code: "listener_ownership_mismatch" },
+      { ownership: { present: false, loopbackOnly: true, ownerUidMatches: true, inodes: [] }, code: "listener_absent" },
+      { ownership: { present: true, loopbackOnly: false, ownerUidMatches: true, inodes: ["5001"] }, code: "listener_not_loopback" },
+      { ownership: { present: true, loopbackOnly: true, ownerUidMatches: false, inodes: ["5001"] }, code: "listener_ownership_mismatch" },
     ]) {
       const fake = new FakeTailscale();
       const { core, audit } = makeCore(fake, registryPath, () => ownership);
@@ -213,6 +216,194 @@ describe("expose", () => {
     }
   });
 
+  it("denies a listener that is present and correctly owned but cannot be named", async () => {
+    // Present-but-unattributable is not permission. Without a socket identity
+    // the broker cannot prove the socket it publishes is the socket it verified,
+    // so it must refuse rather than fall through to "the predicates passed".
+    const fake = new FakeTailscale();
+    const { core, audit } = makeCore(fake, registryPath, () => ({
+      present: true,
+      loopbackOnly: true,
+      ownerUidMatches: true,
+      inodes: [],
+    }));
+    const res = await reserveAndExpose(core);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("listener_unattributable");
+    expect(fake.exposeCalls).toBe(0);
+    expect([...fake.ports]).toEqual([[443, "http://127.0.0.1:3100"]]);
+    expect(audit.events.find((event) => event.decision === "deny")?.reasonCode).toBe(
+      "listener_unattributable",
+    );
+  });
+
+  it("denies before publishing when the listener is substituted during the Serve status read", async () => {
+    // The window Greptile found: pre-flight verifies the listener, then
+    // `readServe()` runs a `tailscale` subprocess. A process under the same
+    // managed-runtime UID can close the verified socket and take the port during
+    // that subprocess. The three boolean predicates cannot see it — the new
+    // process satisfies all of them — so only the socket identity changes.
+    // Publishing then maps tailnet HTTPS at a service that was never authorized.
+    const fake = new FakeTailscale();
+    // Armed relative to the start of expose, because reserve already reads Serve
+    // status once. The swap therefore lands on expose's own status subprocess —
+    // after its pre-flight verification, before it publishes anything.
+    let statusReadsBeforeExpose = 0;
+    const { core, audit } = makeCore(fake, registryPath, () => ({
+      present: true,
+      loopbackOnly: true,
+      ownerUidMatches: true,
+      inodes: [fake.statusCalls > statusReadsBeforeExpose ? "9999" : "5001"],
+    }));
+
+    const reserved = await core.handle(reserveReq(), PEER);
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+    statusReadsBeforeExpose = fake.statusCalls;
+
+    const res = await core.handle(
+      { op: "expose", requestId: "req-sub", runtimeId: RUNTIME_A, handle: reserved.handle },
+      PEER,
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("listener_substituted");
+
+    // Fail closed *before* the mutation: the substituted service is never
+    // published, so only the pre-existing primary route remains.
+    expect(fake.exposeCalls).toBe(0);
+    expect([...fake.ports]).toEqual([[443, "http://127.0.0.1:3100"]]);
+    expect(audit.events.find((event) => event.decision === "deny")?.reasonCode).toBe(
+      "listener_substituted",
+    );
+  });
+
+  it("withdraws the mapping when substitution happens after the port is published", async () => {
+    // If the swap lands after the mutation instead, the post-publication re-proof
+    // denies inside the try, so compensation removes what was applied rather
+    // than leaving a substituted service reachable over HTTPS.
+    const fake = new FakeTailscale();
+    const { core } = makeCore(fake, registryPath, () => ({
+      present: true,
+      loopbackOnly: true,
+      ownerUidMatches: true,
+      inodes: [fake.exposeCalls >= 1 ? "9999" : "5001"],
+    }));
+
+    const res = await reserveAndExpose(core);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("listener_substituted");
+
+    // The port was published, then withdrawn by compensation.
+    expect(fake.exposeCalls).toBeGreaterThan(0);
+    expect(fake.removeCalls).toBeGreaterThan(0);
+    expect([...fake.ports]).toEqual([[443, "http://127.0.0.1:3100"]]);
+  });
+
+  it("withdraws an idempotently-skipped mapping whose listener was substituted", async () => {
+    // The gap a skipped mapping opens: on a re-expose the port already carries
+    // our exact same-number entry, so the apply loop skips it and it never
+    // enters `appliedPorts`. Denying alone would leave that pre-existing mapping
+    // active and now pointing at the replacement service, so a rejected request
+    // would still publish something unauthorized.
+    const fake = new FakeTailscale();
+    // Swap armed relative to the start of the *second* expose, so it lands after
+    // that request's pre-flight verification — the same window as before, but on
+    // a port the apply loop will skip instead of publish.
+    let statusReadsBeforeReExpose = Number.POSITIVE_INFINITY;
+    const { core } = makeCore(fake, registryPath, () => ({
+      present: true,
+      loopbackOnly: true,
+      ownerUidMatches: true,
+      inodes: [fake.statusCalls > statusReadsBeforeReExpose ? "9999" : "5001"],
+    }));
+
+    // First expose publishes the port for real.
+    const first = await reserveAndExpose(core);
+    expect(first.ok).toBe(true);
+    expect(fake.ports.get(42010)).toBe("http://127.0.0.1:42010");
+    const exposeCallsAfterFirst = fake.exposeCalls;
+
+    // Re-expose the same port. The mapping already matches, so the apply loop
+    // takes the idempotent path and publishes nothing.
+    const reserved = await core.handle(reserveReq(), PEER);
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+    statusReadsBeforeReExpose = fake.statusCalls;
+
+    const second = await core.handle(
+      { op: "expose", requestId: "req-again", runtimeId: RUNTIME_A, handle: reserved.handle },
+      PEER,
+    );
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.code).toBe("listener_substituted");
+    expect(fake.exposeCalls).toBe(exposeCallsAfterFirst); // nothing re-published
+
+    // The substituted mapping must not survive the rejected request.
+    expect(fake.removeCalls).toBeGreaterThan(0);
+    expect(fake.ports.has(42010)).toBe(false);
+    expect([...fake.ports]).toEqual([[443, "http://127.0.0.1:3100"]]);
+  });
+
+  it("never removes an adopted port whose Serve entry is no longer ours, and quarantines it", async () => {
+    // Withdrawing an idempotently-skipped port must not become a provenance-blind
+    // deletion. If the Serve entry itself was replaced concurrently, removing by
+    // port number would destroy an operator or unknown mapping. The port is left
+    // alone and quarantined instead, so it is never silently reused either.
+    const fake = new FakeTailscale();
+    let statusReadsBeforeReExpose = Number.POSITIVE_INFINITY;
+    const { core } = makeCore(fake, registryPath, () => {
+      const swapped = fake.statusCalls > statusReadsBeforeReExpose;
+      // The Serve entry is replaced at the same moment the listener is, and after
+      // the transaction's `before` snapshot — so the pre-existing
+      // `manual_mapping_present` guard cannot catch it and the withdrawal path is
+      // the one that has to stay provenance-aware.
+      if (swapped) fake.ports.set(42010, "http://10.0.0.5:9999");
+      return {
+        present: true,
+        loopbackOnly: true,
+        ownerUidMatches: true,
+        inodes: [swapped ? "9999" : "5001"],
+      };
+    });
+
+    const first = await reserveAndExpose(core);
+    expect(first.ok).toBe(true);
+    const removeCallsAfterFirst = fake.removeCalls;
+
+    const reserved = await core.handle(reserveReq(), PEER);
+    if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
+    statusReadsBeforeReExpose = fake.statusCalls;
+
+    const second = await core.handle(
+      { op: "expose", requestId: "req-foreign", runtimeId: RUNTIME_A, handle: reserved.handle },
+      PEER,
+    );
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.code).toBe("listener_substituted");
+
+    // The foreign mapping survives untouched, and the port is quarantined.
+    expect(fake.removeCalls).toBe(removeCallsAfterFirst);
+    expect(fake.ports.get(42010)).toBe("http://10.0.0.5:9999");
+    expect(JSON.parse(readFileSync(registryPath, "utf8")).quarantinedPorts).toContain(42010);
+  });
+
+  it("withdraws a published mapping when the listener disappears entirely", async () => {
+    // Absent is not "unchanged". A closed listener leaves the mapping pointing at
+    // nothing, which a later process on that port would inherit, so it must be
+    // withdrawn like any other substitution.
+    const fake = new FakeTailscale();
+    const { core } = makeCore(fake, registryPath, () => ({
+      present: fake.exposeCalls === 0,
+      loopbackOnly: true,
+      ownerUidMatches: true,
+      inodes: fake.exposeCalls === 0 ? ["5001"] : [],
+    }));
+
+    const res = await reserveAndExpose(core);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("listener_substituted");
+    expect(fake.removeCalls).toBeGreaterThan(0);
+    expect([...fake.ports]).toEqual([[443, "http://127.0.0.1:3100"]]);
+  });
+
   it("denies an absent listener without consuming the reservation or touching Serve", async () => {
     // A denial is pure: it neither publishes a mapping nor burns the lease. No
     // production caller retries an exposure today (deliberately — a retry needs
@@ -224,6 +415,7 @@ describe("expose", () => {
       present: bound,
       loopbackOnly: true,
       ownerUidMatches: true,
+      inodes: bound ? ["5001"] : [],
     }));
     const reserved = await core.handle(reserveReq(), PEER);
     if (!reserved.ok || reserved.op !== "reserve") throw new Error("reserve failed");
@@ -370,7 +562,7 @@ describe("node identity", () => {
       isAllowedPort: defaultIsAllowedPort,
       deps: {
         runTailscale: fake.run,
-        verifyListenerOwnership: () => ({ present: true, loopbackOnly: true, ownerUidMatches: true }),
+        verifyListenerOwnership: () => ({ present: true, loopbackOnly: true, ownerUidMatches: true, inodes: ["5001"] }),
         nowIso: () => "2026-08-11T00:00:00.000Z",
       },
     });
